@@ -1,4 +1,4 @@
-use clap::{Command, Error, arg};
+use clap::{ArgAction, Command, Error, arg, error::ErrorKind};
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -7,10 +7,20 @@ fn cli() -> Command {
         .about("A music management tool")
         .subcommand_required(true)
         .arg_required_else_help(true)
+        .arg(
+            arg!(-v --verbose "Increase output verbosity.")
+                .action(ArgAction::Count)
+                .global(true),
+        )
+        .arg(
+            arg!(-t --test "Dry run subcommand. Don't make any changes to the database.")
+                .global(true),
+        )
         .allow_external_subcommands(true)
         .subcommand(
             Command::new("import") // accepts list of files or dirs to import
                 .about("Imports music files")
+                .arg(arg!(-d --database "Import from preexisting database."))
                 .arg(
                     arg!(<PATH> ... "The file(s) or directory(ies) to import.")
                         .value_parser(clap::value_parser!(PathBuf)),
@@ -20,12 +30,14 @@ fn cli() -> Command {
         .subcommand(
             Command::new("config") // interact with the config file
                 .about("Modify the config file")
-                .arg(arg!(-e --edit "Edit the config file with default editor"))
-                .arg(arg!(-f --file "Return current config file")),
-            // later add subcommand set which allows setting of key-value pairs
+                .arg(
+                    arg!(-e --edit "Edit the config file with default editor.")
+                        .conflicts_with("file"),
+                )
+                .arg(arg!(-f --file "Return current config file.").conflicts_with("edit")), // later add subcommand set which allows setting of key-value pairs
         )
         .subcommand(
-            Command::new("getinfo") // read file metadata
+            Command::new("info") // read file metadata
                 .about("reads file metadata")
                 .arg(
                     arg!(<PATH> ... "The file(s) whose info you want to get.")
@@ -36,7 +48,14 @@ fn cli() -> Command {
 }
 
 fn main() -> Result<(), Error> {
-    let matches = cli().try_get_matches()?;
+    let mut command = cli();
+    let matches = command.try_get_matches_from_mut(std::env::args_os())?;
+
+    // ArgAction::Count produces:
+    // -v   => 1
+    // -vv  => 2
+    // -vvv => 3
+    let verbosity = matches.get_count("verbose");
 
     match matches.subcommand() {
         Some(("import", sub_matches)) => {
@@ -45,19 +64,42 @@ fn main() -> Result<(), Error> {
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
-            println!("Importing {import_paths:?}");
+
+            let from_database = sub_matches.get_flag("database");
+            let dry_run = sub_matches.get_flag("test");
+
+            if from_database && import_paths.len() != 1 {
+                return Err(command.error(
+                    ErrorKind::WrongNumberOfValues,
+                    "`--database` requires exactly one path.",
+                ));
+            }
+            if verbosity > 0 {
+                println!("Verbosity level: {verbosity}\nDry run: {dry_run}");
+            }
+
+            if from_database {
+                println!("Importing database from {:?}", import_paths[0]);
+            } else {
+                println!("Importing {import_paths:?}");
+            }
         }
-        Some(("config", _sub_matches)) => {
-            // Here I need to test and see what flag was passed as bool essentially...
-            println!("config boolean options have not yet been implemented");
+        Some(("config", sub_matches)) => {
+            if sub_matches.get_flag("edit") {
+                println!("Editing the config file.");
+            } else if sub_matches.get_flag("file") {
+                println!("Returning the config file path.");
+            } else {
+                println!("No config action specified");
+            }
         }
-        Some(("getinfo", sub_matches)) => {
-            let import_paths = sub_matches
+        Some(("info", sub_matches)) => {
+            let info_paths = sub_matches
                 .get_many::<PathBuf>("PATH")
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
-            println!("Adding {import_paths:?}");
+            println!("getting info about {info_paths:?}");
         }
         Some((ext, sub_matches)) => {
             // Need to figure out what on earth this does

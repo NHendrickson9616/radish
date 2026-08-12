@@ -58,10 +58,47 @@ radish config -f
  The current plan is to use sqlite for the central db that stores the quintessential structure. Would prefer to keep to one db for simplicity. Headers will be initially derived from beets' current setup and MusicBrainz fields
 
  #### *\[TODO\]* Information Shape
-  Future plans around the shape of the information in the database will be put here
+ This is a potential shape for the info, but still a WIP
+ ```
+ items
+   id
+   created_at
+   updated_at
+ 
+ files
+   id
+   item_id
+   path
+   content_hash
+   size
+   modified_at
+   format
+   unavailable_at
+ 
+ metadata
+   item_id
+   field
+   value
+   source
+   updated_at
+ 
+ operations
+   id
+   kind
+   status
+   created_at
+   actor_id
+ 
+ operation_changes
+   operation_id
+   entity_id
+   field
+   old_value
+   new_value
+```
 
 ### Constraints
-- Importing will need to be threaded. Will also need to be concurrent for the case of autotagging. Maybe it would be best to make it threaded in the main src and then add concurrency only in the autotagger.
+- Import must process large libraries efficiently while bounding memory, file descriptors, and external API requests.
 - Needs to be able to run non-interactively to integrate with a future gui or other projects.
 - Needs to be able to test-run/dry-run
 - Code should be written in a way that is easy to logic about, easy to modify to encourage contributors
