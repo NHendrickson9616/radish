@@ -1,6 +1,8 @@
-use clap::{ArgAction, Command, Error, arg, error::ErrorKind};
+use clap::{ArgAction, Command, arg, error::ErrorKind};
 use std::ffi::OsString;
 use std::path::PathBuf;
+
+mod model;
 
 fn cli() -> Command {
     Command::new("rad")
@@ -47,7 +49,10 @@ fn cli() -> Command {
         )
 }
 
-fn main() -> Result<(), Error> {
+fn main() -> Result<(), clap::Error> {
+    tracing_subscriber::fmt::init();
+    tracing::info!("Starting radish");
+
     let mut command = cli();
     let matches = command.try_get_matches_from_mut(std::env::args_os())?;
 
