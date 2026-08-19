@@ -1,8 +1,13 @@
 use clap::{ArgAction, Command, arg, error::ErrorKind};
+use std::error::Error;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+mod import;
+mod metadata;
 mod model;
+
+use import::{ImportOptions, import_db, import_paths};
 
 fn cli() -> Command {
     Command::new("rad")
@@ -23,6 +28,15 @@ fn cli() -> Command {
             Command::new("import") // accepts list of files or dirs to import
                 .about("Imports music files")
                 .arg(arg!(-d --database "Import from preexisting database."))
+                .arg(
+                    arg!(-m --max-depth <DEPTH> "Maximum depth to traverse for audio files.")
+                        .value_parser(clap::value_parser!(usize))
+                        .conflicts_with("database"),
+                )
+                .arg(
+                    arg!(-s --follow-symlinks "Follow symlinks when traversing directories.")
+                        .conflicts_with("database"),
+                )
                 .arg(
                     arg!(<PATH> ... "The file(s) or directory(ies) to import.")
                         .value_parser(clap::value_parser!(PathBuf)),
@@ -49,7 +63,7 @@ fn cli() -> Command {
         )
 }
 
-fn main() -> Result<(), clap::Error> {
+fn main() -> Result<(), Box<dyn Error>> {
     tracing_subscriber::fmt::init();
     tracing::info!("Starting radish");
 
@@ -64,29 +78,44 @@ fn main() -> Result<(), clap::Error> {
 
     match matches.subcommand() {
         Some(("import", sub_matches)) => {
-            let import_paths = sub_matches
+            let paths = sub_matches
                 .get_many::<PathBuf>("PATH")
                 .into_iter()
                 .flatten()
+                .cloned()
                 .collect::<Vec<_>>();
 
             let from_database = sub_matches.get_flag("database");
             let dry_run = sub_matches.get_flag("test");
 
-            if from_database && import_paths.len() != 1 {
-                return Err(command.error(
-                    ErrorKind::WrongNumberOfValues,
-                    "`--database` requires exactly one path.",
-                ));
+            let mut options = ImportOptions::default();
+
+            if let Some(max_depth) = sub_matches.get_one::<usize>("max-depth") {
+                options.max_depth = *max_depth;
             }
+            if sub_matches.get_flag("follow-symlinks") {
+                options.follow_symlinks = true;
+            }
+
+            if from_database && paths.len() != 1 {
+                return Err(command
+                    .error(
+                        ErrorKind::WrongNumberOfValues,
+                        "`--database` requires exactly one path.",
+                    )
+                    .into());
+            }
+
             if verbosity > 0 {
                 println!("Verbosity level: {verbosity}\nDry run: {dry_run}");
             }
 
             if from_database {
-                println!("Importing database from {:?}", import_paths[0]);
+                println!("Importing database from {:?}", paths[0]);
+                import_db(&paths[0], &options)?;
             } else {
-                println!("Importing {import_paths:?}");
+                println!("Importing {paths:?}");
+                import_paths(&paths, &options)?;
             }
         }
         Some(("config", sub_matches)) => {

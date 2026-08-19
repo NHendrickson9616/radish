@@ -22,6 +22,9 @@ pub struct VersionId(pub i64);
 pub struct FileHash(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct AudioHash(pub String);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Encoding {
     Flac,
     Wav,
@@ -31,6 +34,7 @@ pub enum Encoding {
     Aac,
     Opus,
     Aiff,
+    M4a,
     Other(String),
 }
 
@@ -59,14 +63,16 @@ pub struct Version {
 }
 
 /// A file
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct File {
     pub id: FileId,
     pub version_id: VersionId,
     pub path: PathBuf,
-    pub encoding: Encoding,
-    pub content_hash: FileHash,
+    pub encoding: lofty::file::FileType,
+    pub file_hash: FileHash,
+    pub audio_hash: AudioHash,
     pub size_bytes: Option<u64>,
+    pub duration_millis: u64,
 }
 
 /// An album, EP, single, compilation, etc.
@@ -87,4 +93,16 @@ pub struct ReleaseTrack {
     pub disc_number: Option<u32>,
     pub track_number: Option<u32>,
     pub title: String,
+}
+
+pub struct ImportedFileDraft {
+    pub path: PathBuf,
+    pub encoding: lofty::file::FileType,
+    pub file_hash: FileHash,
+    pub size_bytes: u64,
+    pub duration_millis: u64,
+    pub title: Option<String>,
+    pub album: Option<String>,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
 }
