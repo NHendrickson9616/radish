@@ -25,17 +25,16 @@ pub struct FileHash(pub String);
 pub struct AudioHash(pub String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Encoding {
+pub enum AudioCodec {
     Flac,
-    Wav,
+    Pcm,
     Mp3,
-    Ogg,
-    Mp4,
+    Vorbis,
     Aac,
+    Alac,
     Opus,
-    Aiff,
-    M4a,
     Other(String),
+    Unknown,
 }
 
 /// A composition. This can have multiple releases that in turn have multiple recordings
@@ -68,9 +67,10 @@ pub struct File {
     pub id: FileId,
     pub version_id: VersionId,
     pub path: PathBuf,
-    pub encoding: lofty::file::FileType,
+    pub file_type: lofty::file::FileType,
+    pub codec: Option<AudioCodec>,
     pub file_hash: FileHash,
-    pub audio_hash: AudioHash,
+    pub audio_hash: Option<AudioHash>,
     pub size_bytes: Option<u64>,
     pub duration_millis: u64,
 }
@@ -97,10 +97,18 @@ pub struct ReleaseTrack {
 
 pub struct ImportedFileDraft {
     pub path: PathBuf,
-    pub encoding: lofty::file::FileType,
+
+    // file/container facts
+    pub file_type: lofty::file::FileType,
     pub file_hash: FileHash,
     pub size_bytes: u64,
     pub duration_millis: u64,
+
+    // codec facts
+    pub codec: Option<AudioCodec>,
+    pub audio_hash: Option<AudioHash>,
+
+    // Tag facts
     pub title: Option<String>,
     pub album: Option<String>,
     pub track_number: Option<u32>,

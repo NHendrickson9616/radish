@@ -38,6 +38,11 @@ fn cli() -> Command {
                         .conflicts_with("database"),
                 )
                 .arg(
+                    arg!(-a --analysis <ANALYSIS> "Analysis mode to use for imported files.")
+                        .value_parser(clap::value_parser!(import::AnalysisMode))
+                        .default_value("basic"),
+                )
+                .arg(
                     arg!(<PATH> ... "The file(s) or directory(ies) to import.")
                         .value_parser(clap::value_parser!(PathBuf)),
                 )
@@ -95,6 +100,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             if sub_matches.get_flag("follow-symlinks") {
                 options.follow_symlinks = true;
+            }
+            if let Some(analysis) = sub_matches.get_one::<import::AnalysisMode>("analysis") {
+                options.analysis = *analysis;
             }
 
             if from_database && paths.len() != 1 {
