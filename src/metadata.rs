@@ -6,8 +6,8 @@ use lofty::prelude::Accessor;
 use std::fs::File;
 use std::io::Read;
 
+use crate::data_model::{FileHash, ImportedFileDraft};
 use crate::import::{AnalysisMode, ImportOptions};
-use crate::model::{FileHash, ImportedFileDraft};
 
 fn hash_file(path: &Path) -> Result<FileHash, Box<dyn Error>> {
     let mut file = File::open(path)?;
@@ -35,11 +35,11 @@ pub fn make_imported_file_draft(
 
     let fs_metadata = std::fs::metadata(path)?;
 
-    let mut codec = None;
-    let mut audio_hash = None;
+    //let mut codec = None;
+    //let mut audio_hash = None;
 
     if options.analysis == AnalysisMode::Basic {
-        Unimplemented!();
+        unimplemented!();
     }
 
     Ok(ImportedFileDraft {

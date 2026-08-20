@@ -3,9 +3,10 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+mod data_model;
 mod import;
 mod metadata;
-mod model;
+mod operation_model;
 
 use import::{ImportOptions, import_db, import_paths};
 
