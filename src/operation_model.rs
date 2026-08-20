@@ -3,18 +3,82 @@
 //! This is intentionally only a design skeleton. The missing pieces are left visible so we can
 //! discuss the execution shape before choosing concrete storage or persistence details.
 
+use crate::import::AnalysisMode;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
-
+use std::path::{Path, PathBuf};
 // Capabilities used to connect operations.
 
-trait Paths {}
-trait ScanParams {}
-trait FileToImport {}
+trait Paths {
+    fn paths(&self) -> &[PathBuf];
+}
+trait HasScanParams {
+    fn max_depth(&self) -> usize;
+    fn follow_symlinks(&self) -> bool;
+}
+trait HasAnalysisMode {
+    fn analysis_mode(&self) -> AnalysisMode;
+}
+trait FileToImport: HasAnalysisMode {
+    fn path(&self) -> &Path;
+}
 trait ModeledFileData {}
 trait HasFingerprint {}
 trait DuplicateGroup {}
 trait SavedFile {}
+
+struct ScanParams {
+    max_depth: usize,
+    follow_symlinks: bool,
+}
+
+impl HasScanParams for ScanParams {
+    fn max_depth(&self) -> usize {
+        self.max_depth
+    }
+
+    fn follow_symlinks(&self) -> bool {
+        self.follow_symlinks
+    }
+}
+
+struct GeneralImportRequest {
+    scan_params: ScanParams,
+    paths: Vec<PathBuf>,
+}
+
+impl Paths for GeneralImportRequest {
+    fn paths(&self) -> &[PathBuf] {
+        &self.paths
+    }
+}
+
+impl HasScanParams for GeneralImportRequest {
+    fn max_depth(&self) -> usize {
+        self.scan_params.max_depth
+    }
+
+    fn follow_symlinks(&self) -> bool {
+        self.scan_params.follow_symlinks
+    }
+}
+
+struct FileImportRequest {
+    analysis: AnalysisMode,
+    path: Path,
+}
+
+impl HasAnalysisMode for FileImportRequest {
+    fn analysis_mode(&self) -> AnalysisMode {
+        self.analysis
+    }
+}
+
+impl FileToImport for FileImportRequest {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
 
 // Typed operation interface.
 
@@ -29,10 +93,6 @@ trait Runnable {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct WorkflowId(u64);
 
-/// Identifies the output a workflow will have after a particular portion of its queue finishes.
-///
-/// This is a checkpoint rather than a permanent "end of workflow": more work may be appended to
-/// the workflow after another operation has consumed this output.
 struct WorkflowHandle<T> {
     workflow_id: WorkflowId,
     output: PhantomData<fn() -> T>,
@@ -43,137 +103,136 @@ struct OperationError;
 // Operation declarations. Each declaration says which workflow it belongs to and uses generic
 // bounds to describe what it can consume and produce.
 
-struct ScanDirAndFiles<P, F> {
+struct ScanDirAndFiles<In, Out> {
     workflow_id: WorkflowId,
-    params: P,
-    output: PhantomData<fn() -> F>,
+    output: PhantomData<fn(In) -> Out>,
 }
 
-impl<P, F> Runnable for ScanDirAndFiles<P, F>
+impl<In, Out> Runnable for ScanDirAndFiles<In, Out>
 where
-    P: Paths + ScanParams,
-    F: FileToImport,
+    In: Paths + HasScanParams,
+    Out: FileToImport,
 {
-    type Input = P;
-    type Output = Vec<F>;
+    type Input = In;
+    type Output = Vec<Out>;
 
     fn workflow_id(&self) -> WorkflowId {
         self.workflow_id
     }
 
-    fn run(&self, _input: P) -> Result<Vec<F>, OperationError> {
+    fn run(&self, _input: In) -> Result<Vec<Out>, OperationError> {
         todo!("scan directories and return the files that need child workflows")
     }
 }
 
-struct Import<F, M> {
+struct Import<In, Out> {
     workflow_id: WorkflowId,
-    signature: PhantomData<fn(F) -> M>,
+    signature: PhantomData<fn(In) -> Out>,
 }
 
-impl<F, M> Runnable for Import<F, M>
+impl<In, Out> Runnable for Import<In, Out>
 where
-    F: FileToImport,
-    M: ModeledFileData,
+    In: FileToImport,
+    Out: ModeledFileData,
 {
-    type Input = F;
-    type Output = M;
+    type Input = In;
+    type Output = Out;
 
     fn workflow_id(&self) -> WorkflowId {
         self.workflow_id
     }
 
-    fn run(&self, _input: F) -> Result<M, OperationError> {
+    fn run(&self, _input: In) -> Result<Out, OperationError> {
         todo!("import one file")
     }
 }
 
-struct Fingerprint<M, F> {
+struct Fingerprint<In, Out> {
     workflow_id: WorkflowId,
-    signature: PhantomData<fn(M) -> F>,
+    signature: PhantomData<fn(In) -> Out>,
 }
 
-impl<M, F> Runnable for Fingerprint<M, F>
+impl<In, Out> Runnable for Fingerprint<In, Out>
 where
-    M: ModeledFileData,
-    F: ModeledFileData + HasFingerprint,
+    In: ModeledFileData,
+    Out: ModeledFileData + HasFingerprint,
 {
-    type Input = M;
-    type Output = F;
+    type Input = In;
+    type Output = Out;
 
     fn workflow_id(&self) -> WorkflowId {
         self.workflow_id
     }
 
-    fn run(&self, _input: M) -> Result<F, OperationError> {
+    fn run(&self, _input: In) -> Result<Out, OperationError> {
         todo!("add a fingerprint while preserving the modeled-file capabilities")
     }
 }
 
 /// Runs in the scan workflow, but waits for outputs from the spawned import workflows.
-struct ScanForMerges<F, D> {
+struct ScanForMerges<In, Out> {
     workflow_id: WorkflowId,
-    wait_for: Vec<WorkflowHandle<F>>,
-    output: PhantomData<fn() -> D>,
+    wait_for: Vec<WorkflowHandle<In>>,
+    output: PhantomData<fn() -> Out>,
 }
 
-impl<F, D> Runnable for ScanForMerges<F, D>
+impl<In, Out> Runnable for ScanForMerges<In, Out>
 where
-    F: ModeledFileData + HasFingerprint,
-    D: DuplicateGroup,
+    In: ModeledFileData + HasFingerprint,
+    Out: DuplicateGroup,
 {
-    type Input = Vec<F>;
-    type Output = Vec<D>;
+    type Input = Vec<In>;
+    type Output = Vec<Out>;
 
     fn workflow_id(&self) -> WorkflowId {
         self.workflow_id
     }
 
-    fn run(&self, _input: Vec<F>) -> Result<Vec<D>, OperationError> {
+    fn run(&self, _input: Vec<In>) -> Result<Vec<Out>, OperationError> {
         todo!("find groups that should produce merge operations")
     }
 }
 
-struct Merge<D, M> {
+struct Merge<In, Out> {
     workflow_id: WorkflowId,
-    signature: PhantomData<fn(D) -> M>,
+    signature: PhantomData<fn(In) -> Out>,
 }
 
-impl<D, M> Runnable for Merge<D, M>
+impl<In, Out> Runnable for Merge<In, Out>
 where
-    D: DuplicateGroup,
-    M: ModeledFileData,
+    In: DuplicateGroup,
+    Out: ModeledFileData,
 {
-    type Input = D;
-    type Output = M;
+    type Input = In;
+    type Output = Out;
 
     fn workflow_id(&self) -> WorkflowId {
         self.workflow_id
     }
 
-    fn run(&self, _input: D) -> Result<M, OperationError> {
+    fn run(&self, _input: In) -> Result<Out, OperationError> {
         todo!("merge a duplicate group")
     }
 }
 
-struct SaveToDb<M, S> {
+struct SaveToDb<In, Out> {
     workflow_id: WorkflowId,
-    signature: PhantomData<fn(M) -> S>,
+    signature: PhantomData<fn(In) -> Out>,
 }
 
-impl<M, S> Runnable for SaveToDb<M, S>
+impl<In, Out> Runnable for SaveToDb<In, Out>
 where
-    M: ModeledFileData,
-    S: SavedFile,
+    In: ModeledFileData,
+    Out: SavedFile,
 {
-    type Input = M;
-    type Output = S;
+    type Input = In;
+    type Output = Out;
 
     fn workflow_id(&self) -> WorkflowId {
         self.workflow_id
     }
 
-    fn run(&self, _input: M) -> Result<S, OperationError> {
+    fn run(&self, _input: In) -> Result<Out, OperationError> {
         todo!("idempotently save the modeled file")
     }
 }
@@ -184,7 +243,7 @@ where
 /// constructed. There are no trait objects and operation outputs are not erased.
 enum Operation<P, FI, M, FP, D, MR, S>
 where
-    P: Paths + ScanParams,
+    P: Paths + HasScanParams,
     FI: FileToImport,
     M: ModeledFileData,
     FP: ModeledFileData + HasFingerprint,
@@ -202,12 +261,10 @@ where
 
 /// Runtime information for one sequential workflow lane.
 ///
-/// There is deliberately no queued/running/done status. A checkpoint is complete exactly when its
-/// output is present. Operations can be retried because their effects must be idempotent.
+/// Operations can be retried because their effects must be idempotent.
 struct Workflow {
     id: WorkflowId,
-    next_checkpoint: u64,
-    // TODO: Store the latest output/checkpoint without erasing its type. This choice should be
+    // TODO: Store the latest output without erasing its type. This choice should be
     // made after the concrete application data types and transitions are clearer.
 }
 
@@ -225,7 +282,6 @@ impl<Op> Coordinator<Op> {
     where
         O: Runnable + Into<Op>,
     {
-        // Reserve the next checkpoint in operation.workflow_id().
         // Push operation.into() onto the common queue.
         // Return a typed handle to the output that operation will eventually produce.
         todo!()
@@ -243,9 +299,9 @@ impl<Op> Coordinator<Op> {
             // Static dispatch over Operation's variants happens here (or in an Operation method):
             //
             // 1. Take the operation's input from its own workflow, or gather its `wait_for`
-            //    checkpoints from other workflows.
+            //    outputs from other workflows.
             // 2. Call that variant's typed Runnable implementation.
-            // 3. Record the output as the workflow's latest completed checkpoint.
+            // 3. Record the output as the workflow's latest completed output.
             // 4. Enqueue any workflows/operations produced by Scan or ScanForMerges.
             //
             // An execution error is returned for later user handling. No failure status is stored.
@@ -262,11 +318,11 @@ impl<Op> Coordinator<Op> {
 // Workflow 1
 //   ScanDirAndFiles
 //     |
-//     +-- create Workflow 2: Import(file A) -> Fingerprint(file A) -- checkpoint A
-//     +-- create Workflow 3: Import(file B) -> Fingerprint(file B) -- checkpoint B
-//     +-- create Workflow 4: Import(file C) -> Fingerprint(file C) -- checkpoint C
+//     +-- create Workflow 2: Import(file A) -> Fingerprint(file A) -- output A
+//     +-- create Workflow 3: Import(file B) -> Fingerprint(file B) -- output B
+//     +-- create Workflow 4: Import(file C) -> Fingerprint(file C) -- output C
 //     |
-//   ScanForMerges(wait_for: [checkpoint A, checkpoint B, checkpoint C])
+//   ScanForMerges(wait_for: [output A, output B, output C])
 //     |
 //     +-- enqueue Merge operations into the selected child workflow(s)
 //
