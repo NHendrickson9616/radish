@@ -7,6 +7,11 @@ use crate::import::AnalysisMode;
 use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 // Capabilities used to connect operations.
 
 trait Paths {
@@ -45,6 +50,7 @@ impl HasScanParams for ScanParams {
 struct GeneralImportRequest {
     scan_params: ScanParams,
     paths: Vec<PathBuf>,
+    analysis: AnalysisMode,
 }
 
 impl Paths for GeneralImportRequest {
@@ -63,9 +69,15 @@ impl HasScanParams for GeneralImportRequest {
     }
 }
 
+impl HasAnalysisMode for GeneralImportRequest {
+    fn analysis_mode(&self) -> AnalysisMode {
+        self.analysis
+    }
+}
+
 struct FileImportRequest {
     analysis: AnalysisMode,
-    path: Path,
+    path: PathBuf,
 }
 
 impl HasAnalysisMode for FileImportRequest {
@@ -99,6 +111,21 @@ struct WorkflowHandle<T> {
 }
 
 struct OperationError;
+
+struct OperationContext<Op> {
+    pending: Vec<Op>,
+    next_workflow_id: Arc<AtomicU64>,
+}
+
+impl<Op> OperationContext<Op> {
+    fn enqueue(&mut self, operation: Op) {
+        self.pending.push(operation);
+    }
+
+    fn create_workflow_id(&self) -> WorkflowId {
+        WorkflowId(self.next_workflow_id.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 // Operation declarations. Each declaration says which workflow it belongs to and uses generic
 // bounds to describe what it can consume and produce.
@@ -268,26 +295,92 @@ struct Workflow {
     // made after the concrete application data types and transitions are clearer.
 }
 
-/// Owns the operation queue and coordinates sequential lanes and cross-workflow joins.
+/// Shared source of workflow IDs.
+///
+/// Clones of this are cheap and can be handed to concurrently running tasks. Allocated IDs are
+/// unique but not necessarily contiguous; a failed task may allocate an ID that is never committed.
+#[derive(Clone)]
+struct WorkflowIdGenerator {
+    next: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl WorkflowIdGenerator {
+    fn new(first: u64) -> Self {
+        Self {
+            next: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(first)),
+        }
+    }
+
+    fn next(&self) -> WorkflowId {
+        WorkflowId(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Task-facing handle for publishing future operations.
+///
+/// Operations build their own local `Vec<Op>` and publish it as one MPSC batch after successful
+/// execution. This helper only provides the sender and collision-free workflow ID allocation.
+struct FutureOperationProducer<Op> {
+    sender: std::sync::mpsc::Sender<Vec<Op>>,
+    workflow_ids: WorkflowIdGenerator,
+}
+
+impl<Op> FutureOperationProducer<Op> {
+    fn new(sender: std::sync::mpsc::Sender<Vec<Op>>, workflow_ids: WorkflowIdGenerator) -> Self {
+        Self {
+            sender,
+            workflow_ids,
+        }
+    }
+
+    fn create_workflow_id(&self) -> WorkflowId {
+        self.workflow_ids.next()
+    }
+
+    fn publish(&self, operations: Vec<Op>) -> Result<(), OperationError> {
+        self.sender.send(operations).map_err(|_| OperationError)
+    }
+}
+
+/// Owns workflows and coordinates sequential lanes and cross-workflow joins.
 struct Coordinator<Op> {
     workflows: Vec<VecDeque<Op>>,
+    workflow_ids: WorkflowIdGenerator,
+    future_operation_sender: std::sync::mpsc::Sender<Vec<Op>>,
+    future_operation_receiver: std::sync::mpsc::Receiver<Vec<Op>>,
 }
 
 impl<Op> Coordinator<Op> {
-    fn create_workflow<I>(&mut self, _initial_input: I) -> WorkflowHandle<I> {
-        todo!("create a lane whose initial value is its first available output")
+    fn new() -> Self {
+        let (future_operation_sender, future_operation_receiver) = std::sync::mpsc::channel();
+        Self {
+            workflows: Vec::new(),
+            workflow_ids: WorkflowIdGenerator::new(1),
+            future_operation_sender,
+            future_operation_receiver,
+        }
     }
 
-    fn enqueue<O>(&mut self, _operation: O) -> WorkflowHandle<O::Output>
-    where
-        O: Runnable + Into<Op>,
-    {
-        // Push operation.into() onto the common queue.
-        // Return a typed handle to the output that operation will eventually produce.
-        todo!()
+    fn future_operations(&self) -> FutureOperationProducer<Op> {
+        FutureOperationProducer::new(
+            self.future_operation_sender.clone(),
+            self.workflow_ids.clone(),
+        )
+    }
+
+    fn drain_future_operations(&mut self) {
+        while let Ok(operations) = self.future_operation_receiver.try_recv() {
+            for operation in operations {
+                // Route by operation.workflow_id() once the concrete `Operation` dispatch exists.
+                // If the workflow does not exist yet, create its lane here.
+                let _ = operation;
+            }
+        }
     }
 
     fn next_ready(&mut self) -> Option<Op> {
+        self.drain_future_operations();
+
         // A normal operation is ready when its workflow has its expected latest output.
         // A join operation is ready when every WorkflowHandle in `wait_for` is available.
         // Operations that are not ready stay queued while other workflows make progress.
@@ -296,16 +389,21 @@ impl<Op> Coordinator<Op> {
 
     fn run(&mut self) -> Result<(), OperationError> {
         while let Some(operation) = self.next_ready() {
+            let future_operations = self.future_operations();
+
             // Static dispatch over Operation's variants happens here (or in an Operation method):
             //
             // 1. Take the operation's input from its own workflow, or gather its `wait_for`
             //    outputs from other workflows.
-            // 2. Call that variant's typed Runnable implementation.
-            // 3. Record the output as the workflow's latest completed output.
-            // 4. Enqueue any workflows/operations produced by Scan or ScanForMerges.
+            // 2. Pass a `FutureOperationProducer` to the operation.
+            // 3. The operation builds a local Vec<Op> for future work.
+            // 4. If the operation succeeds, record its output and publish that Vec as one MPSC batch.
+            // 5. If the operation fails, discard the local Vec and report the error.
             //
-            // An execution error is returned for later user handling. No failure status is stored.
+            // Published batches contain ordinary operation values. Their workflow IDs decide which
+            // workflow queue the coordinator appends them to.
             let _ = operation;
+            let _ = future_operations;
         }
 
         Ok(())
