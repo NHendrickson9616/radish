@@ -3,6 +3,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+mod config;
 mod data_model;
 mod import;
 mod metadata;
