@@ -4,13 +4,9 @@
 //! discuss the execution shape before choosing concrete storage or persistence details.
 
 use crate::import::AnalysisMode;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
 
 // Capabilities used to connect operations.
 
@@ -94,12 +90,16 @@ impl FileToImport for FileImportRequest {
 
 // Typed operation interface.
 
-trait Runnable {
+trait Runnable<Op> {
     type Input;
     type Output;
 
-    fn workflow_id(&self) -> WorkflowId;
-    fn run(&self, input: Self::Input) -> Result<Self::Output, OperationError>;
+    fn run(
+        &self,
+        workflow_id: WorkflowId,
+        input: Self::Input,
+        future_operations: &FutureOperationProducer<Op>,
+    ) -> Result<Self::Output, OperationError>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -112,30 +112,14 @@ struct WorkflowHandle<T> {
 
 struct OperationError;
 
-struct OperationContext<Op> {
-    pending: Vec<Op>,
-    next_workflow_id: Arc<AtomicU64>,
-}
-
-impl<Op> OperationContext<Op> {
-    fn enqueue(&mut self, operation: Op) {
-        self.pending.push(operation);
-    }
-
-    fn create_workflow_id(&self) -> WorkflowId {
-        WorkflowId(self.next_workflow_id.fetch_add(1, Ordering::Relaxed))
-    }
-}
-
-// Operation declarations. Each declaration says which workflow it belongs to and uses generic
-// bounds to describe what it can consume and produce.
+// Operation declarations use generic bounds to describe what they can consume and produce.
+// Workflow association is supplied by the workflow queue that contains each operation.
 
 struct ScanDirAndFiles<In, Out> {
-    workflow_id: WorkflowId,
     output: PhantomData<fn(In) -> Out>,
 }
 
-impl<In, Out> Runnable for ScanDirAndFiles<In, Out>
+impl<Op, In, Out> Runnable<Op> for ScanDirAndFiles<In, Out>
 where
     In: Paths + HasScanParams,
     Out: FileToImport,
@@ -143,21 +127,21 @@ where
     type Input = In;
     type Output = Vec<Out>;
 
-    fn workflow_id(&self) -> WorkflowId {
-        self.workflow_id
-    }
-
-    fn run(&self, _input: In) -> Result<Vec<Out>, OperationError> {
+    fn run(
+        &self,
+        _workflow_id: WorkflowId,
+        _input: In,
+        _future_operations: &FutureOperationProducer<Op>,
+    ) -> Result<Vec<Out>, OperationError> {
         todo!("scan directories and return the files that need child workflows")
     }
 }
 
 struct Import<In, Out> {
-    workflow_id: WorkflowId,
     signature: PhantomData<fn(In) -> Out>,
 }
 
-impl<In, Out> Runnable for Import<In, Out>
+impl<Op, In, Out> Runnable<Op> for Import<In, Out>
 where
     In: FileToImport,
     Out: ModeledFileData,
@@ -165,21 +149,21 @@ where
     type Input = In;
     type Output = Out;
 
-    fn workflow_id(&self) -> WorkflowId {
-        self.workflow_id
-    }
-
-    fn run(&self, _input: In) -> Result<Out, OperationError> {
+    fn run(
+        &self,
+        _workflow_id: WorkflowId,
+        _input: In,
+        _future_operations: &FutureOperationProducer<Op>,
+    ) -> Result<Out, OperationError> {
         todo!("import one file")
     }
 }
 
 struct Fingerprint<In, Out> {
-    workflow_id: WorkflowId,
     signature: PhantomData<fn(In) -> Out>,
 }
 
-impl<In, Out> Runnable for Fingerprint<In, Out>
+impl<Op, In, Out> Runnable<Op> for Fingerprint<In, Out>
 where
     In: ModeledFileData,
     Out: ModeledFileData + HasFingerprint,
@@ -187,23 +171,23 @@ where
     type Input = In;
     type Output = Out;
 
-    fn workflow_id(&self) -> WorkflowId {
-        self.workflow_id
-    }
-
-    fn run(&self, _input: In) -> Result<Out, OperationError> {
+    fn run(
+        &self,
+        _workflow_id: WorkflowId,
+        _input: In,
+        _future_operations: &FutureOperationProducer<Op>,
+    ) -> Result<Out, OperationError> {
         todo!("add a fingerprint while preserving the modeled-file capabilities")
     }
 }
 
 /// Runs in the scan workflow, but waits for outputs from the spawned import workflows.
 struct ScanForMerges<In, Out> {
-    workflow_id: WorkflowId,
     wait_for: Vec<WorkflowHandle<In>>,
     output: PhantomData<fn() -> Out>,
 }
 
-impl<In, Out> Runnable for ScanForMerges<In, Out>
+impl<Op, In, Out> Runnable<Op> for ScanForMerges<In, Out>
 where
     In: ModeledFileData + HasFingerprint,
     Out: DuplicateGroup,
@@ -211,21 +195,21 @@ where
     type Input = Vec<In>;
     type Output = Vec<Out>;
 
-    fn workflow_id(&self) -> WorkflowId {
-        self.workflow_id
-    }
-
-    fn run(&self, _input: Vec<In>) -> Result<Vec<Out>, OperationError> {
+    fn run(
+        &self,
+        _workflow_id: WorkflowId,
+        _input: Vec<In>,
+        _future_operations: &FutureOperationProducer<Op>,
+    ) -> Result<Vec<Out>, OperationError> {
         todo!("find groups that should produce merge operations")
     }
 }
 
 struct Merge<In, Out> {
-    workflow_id: WorkflowId,
     signature: PhantomData<fn(In) -> Out>,
 }
 
-impl<In, Out> Runnable for Merge<In, Out>
+impl<Op, In, Out> Runnable<Op> for Merge<In, Out>
 where
     In: DuplicateGroup,
     Out: ModeledFileData,
@@ -233,21 +217,21 @@ where
     type Input = In;
     type Output = Out;
 
-    fn workflow_id(&self) -> WorkflowId {
-        self.workflow_id
-    }
-
-    fn run(&self, _input: In) -> Result<Out, OperationError> {
+    fn run(
+        &self,
+        _workflow_id: WorkflowId,
+        _input: In,
+        _future_operations: &FutureOperationProducer<Op>,
+    ) -> Result<Out, OperationError> {
         todo!("merge a duplicate group")
     }
 }
 
 struct SaveToDb<In, Out> {
-    workflow_id: WorkflowId,
     signature: PhantomData<fn(In) -> Out>,
 }
 
-impl<In, Out> Runnable for SaveToDb<In, Out>
+impl<Op, In, Out> Runnable<Op> for SaveToDb<In, Out>
 where
     In: ModeledFileData,
     Out: SavedFile,
@@ -255,11 +239,12 @@ where
     type Input = In;
     type Output = Out;
 
-    fn workflow_id(&self) -> WorkflowId {
-        self.workflow_id
-    }
-
-    fn run(&self, _input: In) -> Result<Out, OperationError> {
+    fn run(
+        &self,
+        _workflow_id: WorkflowId,
+        _input: In,
+        _future_operations: &FutureOperationProducer<Op>,
+    ) -> Result<Out, OperationError> {
         todo!("idempotently save the modeled file")
     }
 }
@@ -295,67 +280,52 @@ struct Workflow {
     // made after the concrete application data types and transitions are clearer.
 }
 
-/// Shared source of workflow IDs.
-///
-/// Clones of this are cheap and can be handed to concurrently running tasks. Allocated IDs are
-/// unique but not necessarily contiguous; a failed task may allocate an ID that is never committed.
-#[derive(Clone)]
-struct WorkflowIdGenerator {
-    next: std::sync::Arc<std::sync::atomic::AtomicU64>,
-}
-
-impl WorkflowIdGenerator {
-    fn new(first: u64) -> Self {
-        Self {
-            next: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(first)),
-        }
-    }
-
-    fn next(&self) -> WorkflowId {
-        WorkflowId(self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
-    }
-}
-
 /// Task-facing handle for publishing future operations.
 ///
-/// Operations build their own local `Vec<Op>` and publish it as one MPSC batch after successful
+/// Operations group future work by workflow and publish it as one MPSC batch after successful
 /// execution. This helper only provides the sender and collision-free workflow ID allocation.
 struct FutureOperationProducer<Op> {
-    sender: std::sync::mpsc::Sender<Vec<Op>>,
-    workflow_ids: WorkflowIdGenerator,
+    sender: std::sync::mpsc::Sender<HashMap<WorkflowId, Vec<Op>>>,
+    next_workflow_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl<Op> FutureOperationProducer<Op> {
-    fn new(sender: std::sync::mpsc::Sender<Vec<Op>>, workflow_ids: WorkflowIdGenerator) -> Self {
+    fn new(
+        sender: std::sync::mpsc::Sender<HashMap<WorkflowId, Vec<Op>>>,
+        next_workflow_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
         Self {
             sender,
-            workflow_ids,
+            next_workflow_id,
         }
     }
 
     fn create_workflow_id(&self) -> WorkflowId {
-        self.workflow_ids.next()
+        WorkflowId(
+            self.next_workflow_id
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
-    fn publish(&self, operations: Vec<Op>) -> Result<(), OperationError> {
+    fn publish(&self, operations: HashMap<WorkflowId, Vec<Op>>) -> Result<(), OperationError> {
         self.sender.send(operations).map_err(|_| OperationError)
     }
 }
 
 /// Owns workflows and coordinates sequential lanes and cross-workflow joins.
 struct Coordinator<Op> {
-    workflows: Vec<VecDeque<Op>>,
-    workflow_ids: WorkflowIdGenerator,
-    future_operation_sender: std::sync::mpsc::Sender<Vec<Op>>,
-    future_operation_receiver: std::sync::mpsc::Receiver<Vec<Op>>,
+    workflows: HashMap<WorkflowId, VecDeque<Op>>,
+    next_workflow_id: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    future_operation_sender: std::sync::mpsc::Sender<HashMap<WorkflowId, Vec<Op>>>,
+    future_operation_receiver: std::sync::mpsc::Receiver<HashMap<WorkflowId, Vec<Op>>>,
 }
 
 impl<Op> Coordinator<Op> {
     fn new() -> Self {
         let (future_operation_sender, future_operation_receiver) = std::sync::mpsc::channel();
         Self {
-            workflows: Vec::new(),
-            workflow_ids: WorkflowIdGenerator::new(1),
+            workflows: HashMap::new(),
+            next_workflow_id: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1)),
             future_operation_sender,
             future_operation_receiver,
         }
@@ -364,21 +334,22 @@ impl<Op> Coordinator<Op> {
     fn future_operations(&self) -> FutureOperationProducer<Op> {
         FutureOperationProducer::new(
             self.future_operation_sender.clone(),
-            self.workflow_ids.clone(),
+            self.next_workflow_id.clone(),
         )
     }
 
     fn drain_future_operations(&mut self) {
-        while let Ok(operations) = self.future_operation_receiver.try_recv() {
-            for operation in operations {
-                // Route by operation.workflow_id() once the concrete `Operation` dispatch exists.
-                // If the workflow does not exist yet, create its lane here.
-                let _ = operation;
+        while let Ok(batch) = self.future_operation_receiver.try_recv() {
+            for (workflow_id, operations) in batch {
+                self.workflows
+                    .entry(workflow_id)
+                    .or_default()
+                    .extend(operations);
             }
         }
     }
 
-    fn next_ready(&mut self) -> Option<Op> {
+    fn next_ready(&mut self) -> Option<(WorkflowId, Op)> {
         self.drain_future_operations();
 
         // A normal operation is ready when its workflow has its expected latest output.
@@ -388,20 +359,18 @@ impl<Op> Coordinator<Op> {
     }
 
     fn run(&mut self) -> Result<(), OperationError> {
-        while let Some(operation) = self.next_ready() {
+        while let Some((workflow_id, operation)) = self.next_ready() {
             let future_operations = self.future_operations();
 
             // Static dispatch over Operation's variants happens here (or in an Operation method):
             //
             // 1. Take the operation's input from its own workflow, or gather its `wait_for`
             //    outputs from other workflows.
-            // 2. Pass a `FutureOperationProducer` to the operation.
-            // 3. The operation builds a local Vec<Op> for future work.
-            // 4. If the operation succeeds, record its output and publish that Vec as one MPSC batch.
-            // 5. If the operation fails, discard the local Vec and report the error.
-            //
-            // Published batches contain ordinary operation values. Their workflow IDs decide which
-            // workflow queue the coordinator appends them to.
+            // 2. Pass this workflow ID and a `FutureOperationProducer` to the operation.
+            // 3. The operation groups future work in a HashMap<WorkflowId, Vec<Op>>.
+            // 4. If the operation succeeds, record its output and publish that map as one MPSC batch.
+            // 5. If the operation fails, discard the local map and report the error.
+            let _ = workflow_id;
             let _ = operation;
             let _ = future_operations;
         }
