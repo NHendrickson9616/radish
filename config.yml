@@ -1,19 +1,12 @@
-# Repository defaults for Radish.
-# A local config may contain only the values it wants to override.
+# Core defaults embedded in the Radish binary.
+# A user config can contain only the values it wants to override.
 version: 1
 
 # Settings understood by the base application.
-core:
-  database: radish.db
-  dry_run: false
-  import:
-    max_depth: 10
-    follow_symlinks: false
-    analysis: basic
-
-# Each plugin owns and validates the values under its name.
-plugins:
-  autotag:
-    enabled: false
-    provider: musicbrainz
-    confidence: 0.9
+database: radish.db
+library: ~/Music
+dry_run: false
+import:
+  max_depth: 10
+  follow_symlinks: false
+  analysis: basic
