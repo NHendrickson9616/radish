@@ -1,37 +1,26 @@
 use std::boxed::Box;
 use std::collections::HashMap;
-use std::error::Error;
+
 use std::path::PathBuf;
 
-use clap::ValueEnum;
 use lofty::probe::Probe;
-use serde::{Deserialize, Serialize};
+
 use walkdir::WalkDir;
 
+use crate::audio_hash::AnalyzeAudio;
 use crate::config::ImportConfig;
 use crate::metadata::make_music_fields;
 use crate::operation_model::{
     FieldName, FieldValue, Fields, FutureOperationProducer, Operation, OperationError,
-    OperationResult, QueuedOperation, ScanForMerges, WorkflowId,
+    OperationResult, QueuedOperation, WorkflowId,
 };
-
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum AnalysisMode {
-    /// Only extract tags, file/container facts, and the full-file hash.
-    Fast,
-    /// Fast analysis plus decoded-audio facts such as codec and audio hash.
-    #[default]
-    Basic,
-    /// Basic analysis plus expensive fingerprinting and loudness analysis.
-    Full,
-}
+use crate::scan_for_merges::ScanForMerges;
 
 pub struct Import;
 
 impl Operation for Import {
     fn requires(&self) -> Vec<FieldName> {
-        vec!["radish.path".into(), "radish.analysis".into()]
+        vec!["radish.path".into()]
     }
 
     fn produces(&self) -> Vec<FieldName> {
@@ -61,15 +50,7 @@ impl Operation for Import {
                 .cloned()
                 .ok_or_else(|| OperationError::MissingField("radish.path".into()))?,
         )?;
-        let analysis: AnalysisMode = serde_yml::from_value(
-            input
-                .get("radish.analysis")
-                .and_then(FieldValue::as_value)
-                .cloned()
-                .ok_or_else(|| OperationError::MissingField("radish.analysis".into()))?,
-        )?;
-
-        make_music_fields(&path, analysis)
+        make_music_fields(&path)
     }
 }
 
@@ -152,65 +133,39 @@ impl Operation for ScanDirAndFiles {
             fields.insert("radish.path", serde_yml::to_value(file)?);
             operations.insert(
                 child_id,
-                vec![QueuedOperation {
-                    operation: Box::new(Import),
-                    fields,
-                    wait_for: Vec::new(),
-                }],
+                vec![
+                    QueuedOperation {
+                        operation: Box::new(Import),
+                        fields,
+                        wait_for: Vec::new(),
+                    },
+                    QueuedOperation {
+                        operation: Box::new(AnalyzeAudio),
+                        fields: Fields::default(),
+                        wait_for: Vec::new(),
+                    },
+                ],
             );
         }
 
-        operations.insert(
-            workflow_id,
-            vec![QueuedOperation {
-                operation: Box::new(ScanForMerges),
-                fields: Fields::default(),
-                wait_for,
-            }],
-        );
+        if !wait_for.is_empty() {
+            operations.insert(
+                workflow_id,
+                vec![QueuedOperation {
+                    operation: Box::new(ScanForMerges),
+                    fields: Fields::default(),
+                    wait_for,
+                }],
+            );
+        }
         future_operations.publish(operations)?;
         Ok(Fields::default())
     }
 }
 
-fn discover_audio_files(
-    paths: &[PathBuf],
-    config: &ImportConfig,
-) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let mut files = Vec::new();
-    for path in paths {
-        if path.is_dir() {
-            let walker = WalkDir::new(path)
-                .follow_links(config.follow_symlinks)
-                .max_depth(config.max_depth);
-
-            for entry in walker.into_iter().filter_map(Result::ok) {
-                if entry.file_type().is_file()
-                    && Probe::open(entry.path())
-                        .ok()
-                        .and_then(|probe| probe.guess_file_type().ok())
-                        .is_some()
-                {
-                    files.push(entry.path().to_path_buf());
-                }
-            }
-        } else {
-            files.push(path.to_path_buf());
-        }
-    }
-    Ok(files)
-}
-
-pub fn import_paths(paths: &[PathBuf], config: &ImportConfig) -> Result<(), Box<dyn Error>> {
-    let files = discover_audio_files(paths, config)?;
-
-    for file in files {
-        let _fields = make_music_fields(&file, config.analysis)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-    }
-    Ok(())
-}
-
-pub fn import_db(_path: &PathBuf, _config: &ImportConfig) -> Result<(), Box<dyn Error>> {
+pub fn import_db(
+    _path: &PathBuf,
+    _config: &ImportConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
     unimplemented!();
 }

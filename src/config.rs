@@ -7,8 +7,6 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::import::AnalysisMode;
-
 const DEFAULT_CONFIG: &str = include_str!("../config.yml");
 pub const CONFIG_PATH: &str = "~/.config/radishes/config.yml";
 
@@ -36,21 +34,17 @@ pub struct Config {
 pub struct ImportConfig {
     pub max_depth: usize,
     pub follow_symlinks: bool,
-    pub analysis: AnalysisMode,
 }
 
 impl ConfigApply for ImportConfig {
-    type CliArgs = (Option<usize>, Option<bool>, Option<AnalysisMode>);
+    type CliArgs = (Option<usize>, Option<bool>);
 
-    fn apply_cli(&mut self, (max_depth, follow_symlinks, analysis): Self::CliArgs) {
+    fn apply_cli(&mut self, (max_depth, follow_symlinks): Self::CliArgs) {
         if let Some(value) = max_depth {
             self.max_depth = value;
         }
         if let Some(value) = follow_symlinks {
             self.follow_symlinks = value;
-        }
-        if let Some(value) = analysis {
-            self.analysis = value;
         }
     }
 }
@@ -138,7 +132,6 @@ mod tests {
         let config = Config::load(None).unwrap();
 
         assert_eq!(config.version, 1);
-        assert_eq!(config.import.analysis, AnalysisMode::Basic);
     }
 
     #[test]
@@ -159,7 +152,7 @@ mod tests {
     #[test]
     fn top_level_plugin_sections_are_collected() {
         let config: Config = serde_yml::from_str(
-            "version: 1\ndatabase: radish.db\nlibrary: ~/Music\ndry_run: false\nimport:\n  max_depth: 10\n  follow_symlinks: false\n  analysis: basic\nautotag:\n  enabled: false\n",
+            "version: 1\ndatabase: radish.db\nlibrary: ~/Music\ndry_run: false\nimport:\n  max_depth: 10\n  follow_symlinks: false\nautotag:\n  enabled: false\n",
         )
         .unwrap();
 
@@ -172,18 +165,17 @@ mod tests {
     #[test]
     fn cli_values_change_only_the_supplied_settings() {
         let mut config: Config = serde_yml::from_str(
-            "version: 1\ndatabase: radish.db\nlibrary: ~/Music\ndry_run: false\nimport:\n  max_depth: 10\n  follow_symlinks: false\n  analysis: basic\n",
+            "version: 1\ndatabase: radish.db\nlibrary: ~/Music\ndry_run: false\nimport:\n  max_depth: 10\n  follow_symlinks: false\n",
         )
         .unwrap();
 
         config.apply_cli((None, None, Some(true)));
-        config.import.apply_cli((Some(20), None, None));
+        config.import.apply_cli((Some(20), None));
 
         assert_eq!(config.database, PathBuf::from("radish.db"));
         assert_eq!(config.library, PathBuf::from("~/Music"));
         assert!(config.dry_run);
         assert_eq!(config.import.max_depth, 20);
         assert!(!config.import.follow_symlinks);
-        assert_eq!(config.import.analysis, AnalysisMode::Basic);
     }
 }

@@ -3,10 +3,9 @@
 version: 1
 
 # Settings understood by the base application.
-database: radish.db
-library: ~/Music
+database: ~/.local/share/radishes/radish.db
+library: ~/music-test-sample
 dry_run: false
 import:
   max_depth: 10
   follow_symlinks: false
-  analysis: basic

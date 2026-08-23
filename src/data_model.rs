@@ -32,10 +32,22 @@ pub struct Recording {
     pub name: String,
 }
 
-/// A version, either a mix or a master of the recording
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionKind {
+    Unknown,
+    Master,
+    Remix,
+    Edit,
+    AlternateMix,
+    Instrumental,
+    Other(String),
+}
+
+/// A master, remix, edit, or other version of a recording.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version {
-    pub name: String,
+    pub kind: VersionKind,
+    pub name: Option<String>,
 }
 
 /// A file

@@ -1,6 +1,7 @@
 //! Outline of the operation/workflow model.
 
 use crate::data_model::{Composition, File, Recording, Release, ReleaseTrack, Version};
+use crate::merge::MergedGroup;
 
 use serde_yml::Value;
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -18,6 +19,7 @@ pub enum FieldValue {
     File(File),
     Release(Release),
     ReleaseTrack(ReleaseTrack),
+    MergedGroup(MergedGroup),
 }
 
 impl FieldValue {
@@ -53,7 +55,12 @@ impl Fields {
         self.values.extend(other.values);
     }
 
-    fn project(&self, shared: &Fields, required: &[FieldName]) -> OperationResult<Fields> {
+    fn project(
+        &self,
+        shared: &Fields,
+        required: &[FieldName],
+        optional: &[FieldName],
+    ) -> OperationResult<Fields> {
         let mut projected = Fields::default();
         for name in required {
             let value = self
@@ -61,6 +68,11 @@ impl Fields {
                 .or_else(|| shared.get(name))
                 .ok_or_else(|| OperationError::MissingField(name.clone()))?;
             projected.insert(name.clone(), value.clone());
+        }
+        for name in optional {
+            if let Some(value) = self.get(name).or_else(|| shared.get(name)) {
+                projected.insert(name.clone(), value.clone());
+            }
         }
         Ok(projected)
     }
@@ -90,6 +102,11 @@ impl std::error::Error for OperationError {}
 
 pub trait Operation: Send {
     fn requires(&self) -> Vec<FieldName>;
+
+    fn optional(&self) -> Vec<FieldName> {
+        Vec::new()
+    }
+
     fn produces(&self) -> Vec<FieldName>;
     fn run(
         &self,
@@ -98,35 +115,6 @@ pub trait Operation: Send {
         future_operations: &FutureOperationProducer,
     ) -> OperationResult<Fields>;
 }
-
-macro_rules! declare_unimplemented_operation {
-    ($name:ident) => {
-        pub struct $name;
-
-        impl Operation for $name {
-            fn requires(&self) -> Vec<FieldName> {
-                todo!(concat!(stringify!($name), " required fields"))
-            }
-
-            fn produces(&self) -> Vec<FieldName> {
-                todo!(concat!(stringify!($name), " produced fields"))
-            }
-
-            fn run(
-                &self,
-                _workflow_id: WorkflowId,
-                _inputs: Vec<Fields>,
-                _future_operations: &FutureOperationProducer,
-            ) -> OperationResult<Fields> {
-                todo!(concat!(stringify!($name), " implementation"))
-            }
-        }
-    };
-}
-
-declare_unimplemented_operation!(ScanForMerges);
-declare_unimplemented_operation!(Merge);
-declare_unimplemented_operation!(SaveToDb);
 
 /// Runtime description of one operation supplied by an external plugin.
 pub struct PluginOperation {
@@ -242,6 +230,24 @@ impl Coordinator {
         )
     }
 
+    pub fn enqueue(
+        &self,
+        operation: Box<dyn Operation>,
+        fields: Fields,
+    ) -> OperationResult<WorkflowId> {
+        let future_operations = self.future_operations();
+        let workflow_id = future_operations.create_workflow_id();
+        future_operations.publish(HashMap::from([(
+            workflow_id,
+            vec![QueuedOperation {
+                operation,
+                fields,
+                wait_for: Vec::new(),
+            }],
+        )]))?;
+        Ok(workflow_id)
+    }
+
     fn drain_future_operations(&mut self) {
         while let Ok(batch) = self.future_operation_receiver.try_recv() {
             for (workflow_id, operations) in batch {
@@ -288,27 +294,29 @@ impl Coordinator {
 
     fn inputs_for(&self, operation: &QueuedOperation) -> OperationResult<Vec<Fields>> {
         if operation.wait_for.is_empty() {
-            return Ok(vec![
-                operation
-                    .fields
-                    .project(&self.shared_fields, &operation.operation.requires())?,
-            ]);
+            return Ok(vec![operation.fields.project(
+                &self.shared_fields,
+                &operation.operation.requires(),
+                &operation.operation.optional(),
+            )?]);
         }
 
         operation
             .wait_for
             .iter()
             .filter_map(|wait_for| match &self.workflows[wait_for].outcome {
-                Some(Ok(fields)) => {
-                    Some(fields.project(&self.shared_fields, &operation.operation.requires()))
-                }
+                Some(Ok(fields)) => Some(fields.project(
+                    &self.shared_fields,
+                    &operation.operation.requires(),
+                    &operation.operation.optional(),
+                )),
                 Some(Err(_)) => None,
                 None => unreachable!("next_ready only returns resolved joins"),
             })
             .collect()
     }
 
-    pub fn run(&mut self) {
+    pub fn run(&mut self) -> OperationResult<()> {
         while let Some((workflow_id, operation)) = self.next_ready() {
             let result = self.inputs_for(&operation).and_then(|inputs| {
                 let future_operations = self.future_operations();
@@ -343,8 +351,252 @@ impl Coordinator {
                 }
             }
         }
+
+        let blocked = self
+            .workflows
+            .iter()
+            .filter(|(_, workflow)| workflow.outcome.is_none() && !workflow.operations.is_empty())
+            .map(|(workflow_id, _)| workflow_id.0.to_string())
+            .collect::<Vec<_>>();
+        if !blocked.is_empty() {
+            return Err(OperationError::Failed(format!(
+                "coordinator blocked waiting for workflows: {}",
+                blocked.join(", ")
+            ))
+            .into());
+        }
+
+        let failures = self
+            .workflows
+            .iter()
+            .filter_map(|(workflow_id, workflow)| match &workflow.outcome {
+                Some(Err(error)) => Some(format!("workflow {}: {error}", workflow_id.0)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !failures.is_empty() {
+            return Err(OperationError::Failed(failures.join("; ")).into());
+        }
+
+        Ok(())
     }
 }
 
 // A join becomes ready when all referenced workflows have an outcome. Failed workflows satisfy
 // the wait but contribute no input fields, allowing a batch import to continue after file errors.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    struct ProduceField {
+        name: &'static str,
+    }
+
+    impl Operation for ProduceField {
+        fn requires(&self) -> Vec<FieldName> {
+            Vec::new()
+        }
+
+        fn produces(&self) -> Vec<FieldName> {
+            vec![self.name.into()]
+        }
+
+        fn run(
+            &self,
+            _workflow_id: WorkflowId,
+            _inputs: Vec<Fields>,
+            _future_operations: &FutureOperationProducer,
+        ) -> OperationResult<Fields> {
+            let mut fields = Fields::default();
+            fields.insert(self.name, serde_yml::to_value(true)?);
+            Ok(fields)
+        }
+    }
+
+    struct Fail;
+
+    impl Operation for Fail {
+        fn requires(&self) -> Vec<FieldName> {
+            Vec::new()
+        }
+
+        fn produces(&self) -> Vec<FieldName> {
+            Vec::new()
+        }
+
+        fn run(
+            &self,
+            _workflow_id: WorkflowId,
+            _inputs: Vec<Fields>,
+            _future_operations: &FutureOperationProducer,
+        ) -> OperationResult<Fields> {
+            Err(OperationError::Failed("intentional failure".into()).into())
+        }
+    }
+
+    struct SpawnChildren {
+        fail_one: bool,
+        joined_inputs: Arc<Mutex<usize>>,
+    }
+
+    impl Operation for SpawnChildren {
+        fn requires(&self) -> Vec<FieldName> {
+            Vec::new()
+        }
+
+        fn produces(&self) -> Vec<FieldName> {
+            Vec::new()
+        }
+
+        fn run(
+            &self,
+            workflow_id: WorkflowId,
+            _inputs: Vec<Fields>,
+            future_operations: &FutureOperationProducer,
+        ) -> OperationResult<Fields> {
+            let first = future_operations.create_workflow_id();
+            let second = future_operations.create_workflow_id();
+            let mut operations = HashMap::new();
+            operations.insert(
+                first,
+                vec![QueuedOperation {
+                    operation: Box::new(ProduceField { name: "child" }),
+                    fields: Fields::default(),
+                    wait_for: Vec::new(),
+                }],
+            );
+            operations.insert(
+                second,
+                vec![QueuedOperation {
+                    operation: if self.fail_one {
+                        Box::new(Fail)
+                    } else {
+                        Box::new(ProduceField { name: "child" })
+                    },
+                    fields: Fields::default(),
+                    wait_for: Vec::new(),
+                }],
+            );
+            operations.insert(
+                workflow_id,
+                vec![QueuedOperation {
+                    operation: Box::new(ObserveJoin(self.joined_inputs.clone())),
+                    fields: Fields::default(),
+                    wait_for: vec![first, second],
+                }],
+            );
+            future_operations.publish(operations)?;
+            Ok(Fields::default())
+        }
+    }
+
+    struct ObserveJoin(Arc<Mutex<usize>>);
+
+    impl Operation for ObserveJoin {
+        fn requires(&self) -> Vec<FieldName> {
+            vec!["child".into()]
+        }
+
+        fn produces(&self) -> Vec<FieldName> {
+            Vec::new()
+        }
+
+        fn run(
+            &self,
+            _workflow_id: WorkflowId,
+            inputs: Vec<Fields>,
+            _future_operations: &FutureOperationProducer,
+        ) -> OperationResult<Fields> {
+            *self
+                .0
+                .lock()
+                .expect("join counter lock should be available") = inputs.len();
+            Ok(Fields::default())
+        }
+    }
+
+    #[test]
+    fn enqueue_seeds_and_completes_a_workflow() {
+        let mut coordinator = Coordinator::new(Fields::default());
+        let workflow_id = coordinator
+            .enqueue(Box::new(ProduceField { name: "result" }), Fields::default())
+            .expect("initial operation should enqueue");
+
+        coordinator.run().expect("workflow should succeed");
+
+        let outcome = coordinator.workflows[&workflow_id]
+            .outcome
+            .as_ref()
+            .expect("workflow should have an outcome")
+            .as_ref()
+            .expect("workflow should have succeeded");
+        assert!(outcome.get("result").is_some());
+    }
+
+    #[test]
+    fn child_workflows_feed_a_join() {
+        let joined_inputs = Arc::new(Mutex::new(0));
+        let mut coordinator = Coordinator::new(Fields::default());
+        coordinator
+            .enqueue(
+                Box::new(SpawnChildren {
+                    fail_one: false,
+                    joined_inputs: joined_inputs.clone(),
+                }),
+                Fields::default(),
+            )
+            .expect("initial operation should enqueue");
+
+        coordinator.run().expect("workflows should succeed");
+
+        assert_eq!(*joined_inputs.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn failures_are_reported_after_other_workflows_continue() {
+        let joined_inputs = Arc::new(Mutex::new(0));
+        let mut coordinator = Coordinator::new(Fields::default());
+        coordinator
+            .enqueue(
+                Box::new(SpawnChildren {
+                    fail_one: true,
+                    joined_inputs: joined_inputs.clone(),
+                }),
+                Fields::default(),
+            )
+            .expect("initial operation should enqueue");
+
+        let error = coordinator
+            .run()
+            .expect_err("child failure should be reported");
+
+        assert!(error.to_string().contains("intentional failure"));
+        assert_eq!(*joined_inputs.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn blocked_workflows_are_reported() {
+        let mut coordinator = Coordinator::new(Fields::default());
+        let future_operations = coordinator.future_operations();
+        let workflow_id = future_operations.create_workflow_id();
+        let missing_workflow = future_operations.create_workflow_id();
+        future_operations
+            .publish(HashMap::from([(
+                workflow_id,
+                vec![QueuedOperation {
+                    operation: Box::new(ProduceField { name: "result" }),
+                    fields: Fields::default(),
+                    wait_for: vec![missing_workflow],
+                }],
+            )]))
+            .expect("blocked operation should publish");
+
+        let error = coordinator
+            .run()
+            .expect_err("blocked workflow should be reported");
+
+        assert!(error.to_string().contains("coordinator blocked"));
+    }
+}

@@ -1,16 +1,24 @@
 use clap::{Arg, ArgAction, Command, arg, error::ErrorKind};
 use std::error::Error;
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 
+mod audio_hash;
 mod config;
 mod data_model;
+mod database;
 mod import;
+mod merge;
 mod metadata;
 mod operation_model;
+mod opus;
+mod save_to_db;
+mod scan_for_merges;
 
 use config::{Config, ConfigApply, config_path};
-use import::{import_db, import_paths};
+use import::{ScanDirAndFiles, import_db};
+use operation_model::{Coordinator, Fields};
 
 fn cli() -> Command {
     Command::new("rad")
@@ -49,10 +57,6 @@ fn cli() -> Command {
                         .conflicts_with("database"),
                 )
                 .arg(
-                    arg!(-a --analysis <ANALYSIS> "Analysis mode to use for imported files.")
-                        .value_parser(clap::value_parser!(import::AnalysisMode)),
-                )
-                .arg(
                     arg!(<PATH> ... "The file(s) or directory(ies) to import.")
                         .value_parser(clap::value_parser!(PathBuf)),
                 )
@@ -63,9 +67,15 @@ fn cli() -> Command {
                 .about("Modify the config file")
                 .arg(
                     arg!(-e --edit "Edit the config file with default editor.")
-                        .conflicts_with("file"),
+                        .conflicts_with("path"),
                 )
-                .arg(arg!(-f --file "Return current config file.").conflicts_with("edit")), // later add subcommand set which allows setting of key-value pairs
+                .arg(arg!(-p --path "Return current config file.").conflicts_with("edit")), // later add subcommand set which allows setting of key-value pairs
+        )
+        .subcommand(
+            Command::new("database") // interact with the SQLite database
+                .about("Inspect the SQLite database")
+                .arg(arg!(-e --edit "Open the database with sqlite3.").conflicts_with("path"))
+                .arg(arg!(-p --path "Print the current database path.").conflicts_with("edit")),
         )
         .subcommand(
             Command::new("info") // read file metadata
@@ -102,11 +112,20 @@ fn initialize(config: &Config) -> Result<operation_model::Fields, Box<dyn Error>
         && !parent.as_os_str().is_empty()
         && !parent.is_dir()
     {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("database directory does not exist: {}", parent.display()),
-        )
-        .into());
+        if parent.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "database directory path is not a directory: {}",
+                    parent.display()
+                ),
+            )
+            .into());
+        }
+
+        if !config.dry_run {
+            std::fs::create_dir_all(parent)?;
+        }
     }
 
     let mut fields = operation_model::Fields::default();
@@ -121,11 +140,35 @@ fn initialize(config: &Config) -> Result<operation_model::Fields, Box<dyn Error>
         "radish.follow_symlinks",
         serde_yml::to_value(config.import.follow_symlinks)?,
     );
-    fields.insert(
-        "radish.analysis",
-        serde_yml::to_value(config.import.analysis)?,
-    );
+
     Ok(fields)
+}
+
+fn edit_config(path: &Path) -> Result<(), Box<dyn Error>> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let editor = std::env::var_os("VISUAL")
+        .or_else(|| std::env::var_os("EDITOR"))
+        .unwrap_or_else(|| "vi".into());
+    let status = ProcessCommand::new(editor).arg(path).status()?;
+    if !status.success() {
+        return Err(
+            std::io::Error::other(format!("config editor exited with status {status}")).into(),
+        );
+    }
+
+    Ok(())
+}
+
+fn edit_database(path: &Path) -> Result<(), Box<dyn Error>> {
+    let status = ProcessCommand::new("sqlite3").arg(path).status()?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!("sqlite3 exited with status {status}")).into());
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -143,7 +186,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let user_config = config_path()?;
 
     if let Some(("config", sub_matches)) = matches.subcommand()
-        && sub_matches.get_flag("file")
+        && sub_matches.get_flag("path")
     {
         println!("{}", user_config.display());
         return Ok(());
@@ -167,12 +210,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             config.import.apply_cli((
                 sub_matches.get_one::<usize>("max-depth").copied(),
                 sub_matches.get_flag("follow-symlinks").then_some(true),
-                sub_matches
-                    .get_one::<import::AnalysisMode>("analysis")
-                    .copied(),
             ));
 
-            let _shared_fields = initialize(&config)?;
+            let shared_fields = initialize(&config)?;
 
             if from_database && paths.len() != 1 {
                 return Err(command
@@ -192,16 +232,35 @@ fn main() -> Result<(), Box<dyn Error>> {
                 import_db(&paths[0], &config.import)?;
             } else {
                 println!("Importing {paths:?}");
-                import_paths(&paths, &config.import)?;
+
+                let mut initial_fields = Fields::default();
+                initial_fields.insert("radish.paths", serde_yml::to_value(paths)?);
+
+                let mut coordinator = Coordinator::new(shared_fields);
+                coordinator
+                    .enqueue(Box::new(ScanDirAndFiles), initial_fields)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                coordinator
+                    .run()
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
             }
         }
         Some(("config", sub_matches)) => {
             if sub_matches.get_flag("edit") {
-                println!("Editing the config file.");
-            } else if sub_matches.get_flag("file") {
-                unreachable!("config --file returns before configuration loading");
+                edit_config(&user_config)?;
+            } else if sub_matches.get_flag("path") {
+                unreachable!("config --path returns before configuration loading");
             } else {
                 println!("No config action specified");
+            }
+        }
+        Some(("database", sub_matches)) => {
+            if sub_matches.get_flag("edit") {
+                edit_database(&config.database)?;
+            } else if sub_matches.get_flag("path") {
+                println!("{}", config.database.display());
+            } else {
+                println!("No database action specified");
             }
         }
         Some(("info", sub_matches)) => {

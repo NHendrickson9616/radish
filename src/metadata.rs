@@ -3,11 +3,14 @@ use std::fs::File as FsFile;
 use std::io::Read;
 use std::path::Path;
 
-use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::config::ParseOptions;
+use lofty::file::TaggedFileExt;
 use lofty::prelude::Accessor;
+use lofty::probe::Probe;
 
-use crate::data_model::{Composition, File, FileHash, Recording, Release, ReleaseTrack, Version};
-use crate::import::AnalysisMode;
+use crate::data_model::{
+    Composition, File, FileHash, Recording, Release, ReleaseTrack, Version, VersionKind,
+};
 use crate::operation_model::{FieldValue, Fields};
 
 fn hash_file(path: &Path) -> Result<FileHash, Box<dyn Error + Send + Sync>> {
@@ -24,12 +27,10 @@ fn hash_file(path: &Path) -> Result<FileHash, Box<dyn Error + Send + Sync>> {
     Ok(FileHash(hasher.finalize().to_hex().to_string()))
 }
 
-pub fn make_music_fields(
-    path: &Path,
-    _analysis: AnalysisMode,
-) -> Result<Fields, Box<dyn Error + Send + Sync>> {
-    let tagged_file = lofty::read_from_path(path)?;
-    let properties = tagged_file.properties();
+pub fn make_music_fields(path: &Path) -> Result<Fields, Box<dyn Error + Send + Sync>> {
+    let tagged_file = Probe::open(path)?
+        .options(ParseOptions::new().read_properties(false))
+        .read()?;
     let tag = tagged_file
         .primary_tag()
         .or_else(|| tagged_file.first_tag());
@@ -62,7 +63,8 @@ pub fn make_music_fields(
     fields.insert(
         "radish.version",
         FieldValue::Version(Version {
-            name: String::new(),
+            kind: VersionKind::Unknown,
+            name: None,
         }),
     );
     fields.insert(
@@ -74,11 +76,7 @@ pub fn make_music_fields(
             file_hash: hash_file(path)?,
             audio_hash: None,
             size_bytes: Some(fs_metadata.len()),
-            duration_millis: properties
-                .duration()
-                .as_millis()
-                .try_into()
-                .expect("duration too long (longer than 584 million years)"),
+            duration_millis: 0,
         }),
     );
 
